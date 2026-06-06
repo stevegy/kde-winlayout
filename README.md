@@ -1,4 +1,4 @@
-# kde-window-saver
+# kde-win-profile
 
 Save and restore multi-display window layouts on **KDE Plasma (Wayland)**.
 
@@ -11,7 +11,7 @@ Captures monitor configuration, virtual desktop layout, and all window positions
 sudo dnf install kdotool python3-dbus
 
 # The script itself — symlink it into PATH
-ln -sf "$(pwd)/kde-window-saver" ~/.local/bin/kde-window-saver
+ln -sf "$(pwd)/kde-win-profile" ~/.local/bin/kde-win-profile
 ```
 
 `kscreen-doctor` is provided by the `kscreen` package (pre-installed on KDE Plasma).
@@ -28,7 +28,7 @@ ln -sf "$(pwd)/kde-window-saver" ~/.local/bin/kde-window-saver
 ## Usage
 
 ```
-kde-window-saver <command> [args...]
+kde-win-profile <command> [args...]
 ```
 
 ### Commands
@@ -45,23 +45,23 @@ kde-window-saver <command> [args...]
 
 ```bash
 # Save your current multi-display setup
-kde-window-saver save coding
+kde-win-profile save coding
 
 # After a reboot or monitor reconnect
-kde-window-saver load coding
+kde-win-profile load coding
 
 # Create profiles for different work modes
-kde-window-saver save dual-screen
-kde-window-saver save single-laptop
+kde-win-profile save dual-screen
+kde-win-profile save single-laptop
 
 # See what you have saved
-kde-window-saver list
+kde-win-profile list
 
 # Inspect a profile
-kde-window-saver show dual-screen | jq '.windows[] | {class, name, x, y}'
+kde-win-profile show dual-screen | jq '.windows[] | {class, name, x, y}'
 
 # Remove an old profile
-kde-window-saver delete old-setup
+kde-win-profile delete old-setup
 ```
 
 ## What gets saved
@@ -114,4 +114,4 @@ Profile format:
 
 ## License
 
-MIT
+Apache 2.0

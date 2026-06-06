@@ -1,0 +1,396 @@
+#!/usr/bin/python3
+"""kde-win-profile — Save and restore window positions on KDE Plasma (Wayland)
+
+Requires: kdotool, kscreen-doctor, python3-dbus (optional for virtual desktop info)
+
+Usage:
+  kde-win-profile save [profile-name]
+  kde-win-profile load [profile-name]
+  kde-win-profile list
+  kde-win-profile show [profile-name]
+  kde-win-profile delete <profile-name>
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+PROFILE_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "window-saver" / "profiles"
+DEFAULT_PROFILE = "default"
+
+SKIP_CLASSES = {
+    "plasmashell", "kded5", "kded6", "ksmserver",
+    "kwin", "kwin_wayland", "kwalletd5", "kwalletd6",
+    "xwaylandvideobridge",
+}
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def run(*args: str, check: bool = True, timeout: int = 10) -> subprocess.CompletedProcess:
+    """Run a command, return CompletedProcess.  On failure, return empty-ish result
+    unless *check* is True."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True, check=check, timeout=timeout)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        if check:
+            raise
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+
+
+def kdotool(*args: str) -> str:
+    """Call kdotool and return stripped stdout."""
+    return run("kdotool", *args, check=False).stdout.strip()
+
+
+def cmdline_of(pid: int) -> str:
+    """Read /proc/<pid>/cmdline, truncate to 200 chars."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return raw.replace(b"\0", b" ").decode(errors="replace").strip()[:200]
+    except (OSError, FileNotFoundError):
+        return ""
+
+
+# ── D-Bus helpers (optional) ───────────────────────────────────────────────────
+
+HAS_DBUS = False
+try:
+    import dbus  # noqa: I001
+    HAS_DBUS = True
+except ImportError:
+    pass
+
+
+def _get_desktop_info_via_dbus() -> dict:
+    """Query KWin VirtualDesktopManager.  Returns empty dict on failure."""
+    if not HAS_DBUS:
+        return {"count": 0, "rows": 0, "current": "", "desktops": [],
+                "note": "python3-dbus not available"}
+
+    try:
+        bus = dbus.SessionBus()
+        vdm = bus.get_object("org.kde.KWin", "/VirtualDesktopManager")
+        props = dbus.Interface(vdm, "org.freedesktop.DBus.Properties")
+        desktops_raw = props.Get("org.kde.KWin.VirtualDesktopManager", "desktops")
+        count = int(props.Get("org.kde.KWin.VirtualDesktopManager", "count"))
+        current = str(props.Get("org.kde.KWin.VirtualDesktopManager", "current"))
+        rows = int(props.Get("org.kde.KWin.VirtualDesktopManager", "rows"))
+
+        desktops = [{"index": int(d[0]), "id": str(d[1]), "name": str(d[2])}
+                    for d in desktops_raw]
+
+        return {"count": count, "rows": rows, "current": current, "desktops": desktops}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ── Collectors ─────────────────────────────────────────────────────────────────
+
+def collect_displays() -> dict:
+    """Return ``kscreen-doctor --json`` output as a dict."""
+    result = run("kscreen-doctor", "--json", check=False)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"error": "failed to parse kscreen-doctor output"}
+
+
+def collect_desktops() -> dict:
+    return _get_desktop_info_via_dbus()
+
+
+def collect_windows() -> list[dict]:
+    """Enumerate every window and return its geometry + metadata."""
+    uuids = [u for u in kdotool("search", "").splitlines() if u.strip()]
+    windows: list[dict] = []
+
+    for uuid in uuids:
+        cls = kdotool("getwindowclassname", uuid)
+        name = kdotool("getwindowname", uuid)
+
+        geom = kdotool("getwindowgeometry", uuid)
+        pos_str = ""
+        size_str = ""
+        for line in geom.splitlines():
+            if line.startswith("Position:"):
+                pos_str = line.split(":", 1)[1].strip()
+            elif line.startswith("Geometry:"):
+                size_str = line.split(":", 1)[1].strip()
+
+        x = y = w = h = None
+        if pos_str:
+            parts = pos_str.split(",")
+            try:
+                x, y = float(parts[0]), float(parts[1])
+            except (ValueError, IndexError):
+                pass
+        if size_str:
+            parts = size_str.split("x")
+            try:
+                w, h = float(parts[0]), float(parts[1])
+            except (ValueError, IndexError):
+                pass
+
+        desk_str = kdotool("get_desktop_for_window", uuid)
+        desk = int(desk_str) if desk_str.isdigit() else 0
+
+        pid_str = kdotool("getwindowpid", uuid)
+        pid = int(pid_str) if pid_str.isdigit() else 0
+
+        state = kdotool("windowstate", uuid).lower()
+        minimized = "minimized" in state
+        fullscreen = "fullscreen" in state
+
+        windows.append({
+            "uuid": uuid,
+            "class": cls,
+            "name": name,
+            "x": x, "y": y, "width": w, "height": h,
+            "desktop": desk,
+            "minimized": minimized,
+            "fullscreen": fullscreen,
+            "pid": pid,
+            "cmdline": cmdline_of(pid) if pid else "",
+        })
+
+    return windows
+
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+def cmd_save(profile_name: str = DEFAULT_PROFILE) -> None:
+    profile_path = PROFILE_DIR / f"{profile_name}.json"
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"Saving window layout to profile: {profile_name}")
+    print("-" * 40)
+
+    print("  Capturing display configuration... ", end="", flush=True)
+    displays = collect_displays()
+    print("done")
+
+    print("  Capturing virtual desktop layout... ", end="", flush=True)
+    desktops = collect_desktops()
+    print("done")
+
+    print("  Capturing window positions... ", end="", flush=True)
+    windows = collect_windows()
+    print(f"done ({len(windows)} windows)")
+
+    profile = {
+        "version": 1,
+        "profile_name": profile_name,
+        "created": datetime.now(timezone.utc).astimezone().isoformat(),
+        "hostname": os.uname().nodename,
+        "displays": displays,
+        "virtual_desktops": desktops,
+        "windows": windows,
+    }
+
+    profile_path.write_text(json.dumps(profile, indent=2))
+
+    disp_count = len(displays.get("outputs", []))
+    desk_count = desktops.get("count", 0)
+    print(f"\nProfile saved to: {profile_path}")
+    print(f"  Displays: {disp_count}")
+    print(f"  Desktops: {desk_count}")
+    print(f"  Windows:  {len(windows)}")
+
+
+def cmd_load(profile_name: str = DEFAULT_PROFILE) -> None:
+    profile_path = PROFILE_DIR / f"{profile_name}.json"
+    if not profile_path.is_file():
+        print(f"ERROR: Profile not found: {profile_name}", file=sys.stderr)
+        print("Available profiles:", file=sys.stderr)
+        cmd_list()
+        sys.exit(1)
+
+    print(f"Loading window layout from profile: {profile_name}")
+    print("-" * 41)
+
+    data = json.loads(profile_path.read_text())
+
+    # 1. Restore display configuration
+    print("  Restoring display configuration...")
+    outputs = data.get("displays", {}).get("outputs", [])
+    if outputs:
+        args = ["kscreen-doctor"]
+        for out in outputs:
+            name = out.get("name", "")
+            if not out.get("enabled", True):
+                args.append(f"output.{name}.disable")
+                continue
+            pos = out.get("pos", {})
+            args.append(f"output.{name}.position.{pos.get('x',0)},{pos.get('y',0)}")
+            if mid := out.get("currentModeId", ""):
+                args.append(f"output.{name}.mode.{mid}")
+            args.append(f"output.{name}.scale.{out.get('scale', 1.0)}")
+            rot = out.get("rotation", 1)
+            rot_map = {1: "none", 2: "left", 4: "right", 8: "inverted"}
+            if rot_name := rot_map.get(rot):
+                if rot_name != "none":
+                    args.append(f"output.{name}.rotation.{rot_name}")
+            args.append(f"output.{name}.enable")
+        print(f"    Restoring {len(outputs)} output(s)...")
+        run(*args, check=False)
+    print("    (display config applied — waiting for monitors to settle)")
+    time.sleep(2)
+
+    # 2. Restore windows
+    print("  Restoring window positions...")
+    _restore_windows(data.get("windows", []))
+    print(f"\nLayout restored from: {profile_path}")
+
+
+def _restore_windows(saved: list[dict]) -> None:
+    """Match saved windows to current windows and move/resize them."""
+    # Build current window lookup
+    current = collect_windows()
+    current_by_exact: dict[tuple[str, str], str] = {}   # (cls, name) -> uuid
+    current_by_class: dict[str, list[str]] = {}          # cls -> [uuids...]
+
+    for w in current:
+        key = (w["class"], w["name"])
+        if key not in current_by_exact:
+            current_by_exact[key] = w["uuid"]
+        current_by_class.setdefault(w["class"], []).append(w["uuid"])
+
+    print(f"  Found {len(saved)} windows in profile")
+    restored = skipped = missing = 0
+
+    for i, win in enumerate(saved):
+        cls = win.get("class", "")
+        name = win.get("name", "")
+        x, y = win.get("x"), win.get("y")
+        w_val, h_val = win.get("width"), win.get("height")
+
+        # Skip plasma shell elements and invalid windows
+        if cls in SKIP_CLASSES or x is None or y is None:
+            skipped += 1
+            continue
+
+        # Match: exact (class+name) first, then class-only
+        target_uuid = current_by_exact.get((cls, name))
+        if not target_uuid and cls:
+            class_list = current_by_class.get(cls, [])
+            if class_list:
+                target_uuid = class_list.pop(0)  # Distribute same-class windows
+
+        if not target_uuid:
+            missing += 1
+            continue
+
+        try:
+            if w_val is not None and h_val is not None and w_val > 0 and h_val > 0:
+                kdotool("windowsize", target_uuid, str(int(w_val)), str(int(h_val)))
+                time.sleep(0.02)
+
+            kdotool("windowmove", target_uuid, str(int(x)), str(int(y)))
+
+            desk = win.get("desktop", 0)
+            if desk > 0:
+                kdotool("set_desktop_for_window", target_uuid, str(desk))
+
+            restored += 1
+            if restored % 10 == 0:
+                print(f"    Restored {restored} windows so far...")
+        except Exception as exc:
+            print(f"    Failed to restore {cls} - {name}: {exc}", file=sys.stderr)
+
+    print(f"\n  Results: {restored} restored, {skipped} skipped, {missing} not found")
+
+
+def cmd_list() -> None:
+    print("Saved window layout profiles:")
+    print("=" * 30)
+
+    found = False
+    for fpath in sorted(PROFILE_DIR.glob("*.json")):
+        found = True
+        name = fpath.stem
+        try:
+            data = json.loads(fpath.read_text())
+            created = data.get("created", "unknown")
+            win_count = len(data.get("windows", []))
+        except (json.JSONDecodeError, OSError):
+            created, win_count = "corrupt", 0
+        print(f"  {name:<20s}  {created}  ({win_count} windows)")
+
+    if not found:
+        print("  (no profiles saved yet)")
+
+
+def cmd_show(profile_name: str = DEFAULT_PROFILE) -> None:
+    profile_path = PROFILE_DIR / f"{profile_name}.json"
+    if not profile_path.is_file():
+        print(f"ERROR: Profile not found: {profile_name}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(json.loads(profile_path.read_text()), indent=2))
+
+
+def cmd_delete(profile_name: str) -> None:
+    if not profile_name:
+        print("ERROR: Specify a profile name to delete", file=sys.stderr)
+        sys.exit(1)
+    profile_path = PROFILE_DIR / f"{profile_name}.json"
+    if not profile_path.is_file():
+        print(f"ERROR: Profile not found: {profile_name}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Deleting profile: {profile_name}")
+    profile_path.unlink()
+    print(f"Deleted: {profile_path}")
+
+
+# ── Dependency check ───────────────────────────────────────────────────────────
+
+def check_deps() -> None:
+    missing = []
+    for dep in ("kdotool", "kscreen-doctor"):
+        if shutil.which(dep) is None:
+            missing.append(dep)
+    if missing:
+        print(f"ERROR: Missing dependencies: {' '.join(missing)}", file=sys.stderr)
+        print("Install with: sudo dnf install kdotool", file=sys.stderr)
+        sys.exit(1)
+    if not HAS_DBUS:
+        print("NOTE: python3-dbus not available — virtual desktop info will be limited", file=sys.stderr)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    check_deps()
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    rest = sys.argv[2:] if len(sys.argv) > 2 else []
+
+    if cmd in ("save",):
+        cmd_save(*rest)
+    elif cmd in ("load", "restore"):
+        cmd_load(*rest)
+    elif cmd in ("list", "ls"):
+        cmd_list()
+    elif cmd in ("show", "cat"):
+        cmd_show(*rest)
+    elif cmd in ("delete", "rm", "remove"):
+        cmd_delete(rest[0] if rest else "")
+    elif cmd in ("-h", "--help", "help", ""):
+        print(__doc__)
+        print(f"\nProfiles are stored in: {PROFILE_DIR}")
+        print("Dependencies: kdotool, kscreen-doctor, python3-dbus")
+    else:
+        print(f"ERROR: Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

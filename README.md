@@ -1,4 +1,4 @@
-# kde-win-profile
+# kdewin
 
 Save and restore multi-display window layouts on **KDE Plasma (Wayland)**.
 
@@ -11,7 +11,7 @@ Captures monitor configuration, virtual desktop layout, and all window positions
 sudo dnf install kdotool python3-dbus
 
 # The script itself — symlink it into PATH
-ln -sf "$(pwd)/kde-win-profile" ~/.local/bin/kde-win-profile
+ln -sf "$(pwd)/kdewin" ~/.local/bin/kdewin
 ```
 
 `kscreen-doctor` is provided by the `kscreen` package (pre-installed on KDE Plasma).
@@ -23,12 +23,13 @@ ln -sf "$(pwd)/kde-win-profile" ~/.local/bin/kde-win-profile
 | `kdotool` | Window list, move, resize, state | `kdotool` |
 | `kscreen-doctor` | Display config (modes, scale, position) | `kscreen` |
 | `python3-dbus` | Virtual desktop info via KWin D-Bus | `python3-dbus` |
+| `gdbus` | KWin scripting (move/resize windows) | `glib2` |
 | `jq` | Pretty-printing profiles (optional) | `jq` |
 
 ## Usage
 
 ```
-kde-win-profile <command> [args...]
+kdewin <command> [args...]
 ```
 
 ### Commands
@@ -45,23 +46,23 @@ kde-win-profile <command> [args...]
 
 ```bash
 # Save your current multi-display setup
-kde-win-profile save coding
+kdewin save coding
 
 # After a reboot or monitor reconnect
-kde-win-profile load coding
+kdewin load coding
 
 # Create profiles for different work modes
-kde-win-profile save dual-screen
-kde-win-profile save single-laptop
+kdewin save dual-screen
+kdewin save single-laptop
 
 # See what you have saved
-kde-win-profile list
+kdewin list
 
 # Inspect a profile
-kde-win-profile show dual-screen | jq '.windows[] | {class, name, x, y}'
+kdewin show dual-screen | jq '.windows[] | {class, name, x, y}'
 
 # Remove an old profile
-kde-win-profile delete old-setup
+kdewin delete old-setup
 ```
 
 ## What gets saved
@@ -84,8 +85,9 @@ Plasma shell elements (panels, widgets) are captured but skipped on restore — 
 ## How restore works
 
 1. **Displays first** — `kscreen-doctor` applies saved monitor positions, modes, and scales; waits 2 seconds for monitors to settle
-2. **Window matching** — Each saved window is matched against currently open windows by exact `class + title`, falling back to `class`-only match for same-app windows
-3. **Reposition** — Each matched window is resized and moved to its saved geometry, then assigned to the correct virtual desktop
+2. **Window matching** — Each saved window is matched against currently open windows by exact `class + title`, falling back to `class`-only match for same-app windows. Each current window is only matched once to prevent double-assignment.
+3. **Auto-launch missing apps** — If a saved window is not currently open and its `cmdline` was captured, `kdewin` launches the application automatically and waits for its window to appear.
+4. **Reposition** — Each matched window is moved and resized to its saved geometry in a single atomic operation via the KWin D-Bus Scripting API (avoiding a `kdotool windowmove` bug on KDE 6 Wayland where individual property assignments are silently ignored). Windows are assigned to the correct virtual desktop if applicable.
 
 ## Profiles
 
@@ -108,9 +110,9 @@ Profile format:
 
 - **Wayland only** — Uses `kdotool` which speaks the KWin Wayland protocol. Does not work on X11 (use `wmctrl` / `xdotool` instead).
 - **KDE Plasma only** — Relies on `kscreen-doctor` and KWin D-Bus APIs.
-- **Running apps only** — Does not launch applications; it only repositions already-open windows that match saved entries.
+- **App launch is best-effort** — Auto-launch replays the captured `cmdline` via `shlex.split`. If the app uses a wrapper, launcher, or single-instance mechanism (e.g. Flatpak, Snap, `gtk-launch`), the replayed command may not match the original startup path. Complex command lines may not parse correctly.
 - **Fractional scaling** — Window coordinates are in logical pixels (as reported by KWin), which can produce fractional values under fractional scaling.
-- **Window UUIDs change** — KWin assigns new UUIDs each session, so matching relies on class + title heuristics. Windows with dynamic titles or multiple instances of the same app may not restore perfectly.
+- **Window UUIDs change** — KWin assigns new UUIDs each session, so matching relies on class + title heuristics. Windows with dynamic titles (e.g. `~` for unnamed terminal tabs) or multiple instances of the same app are matched by class order; results may vary if window order changes between sessions.
 
 ## License
 

@@ -34,10 +34,10 @@ class TestStep1(unittest.TestCase):
         mock_popen.side_effect = Exception("Launch failed")
         cmdline = "/usr/bin/invalid"
 
-        # It should catch the exception and print to stderr, not crash
-        with patch('sys.stderr', new=MagicMock()) as mock_stderr:
+        # Now uses logging.error, not print to stderr
+        with patch('kdewin.logging') as mock_logging:
             kdp.launch_app(cmdline)
-            self.assertTrue(mock_stderr.write.called or mock_stderr.flush.called)
+            mock_logging.error.assert_called_once()
 
 if __name__ == '__main__':
     unittest.main()

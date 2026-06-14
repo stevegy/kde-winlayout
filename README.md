@@ -42,6 +42,23 @@ kdewin <command> [args...]
 | `show [profile]` | Show profile contents as JSON |
 | `delete <profile>` | Delete a saved profile |
 
+### Logging
+
+All output uses Python's `logging` module. Control verbosity with `LOG_LEVEL`:
+
+```bash
+# Default: INFO (shows save/load progress)
+kdewin save coding
+
+# Debug: shows window matching details, kdotool queries, launch attempts
+LOG_LEVEL=DEBUG kdewin load coding
+
+# Quiet: only errors
+LOG_LEVEL=ERROR kdewin load coding
+```
+
+Valid levels: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`.
+
 ### Examples
 
 ```bash
@@ -76,9 +93,10 @@ Each profile is a JSON file containing:
   - `class` — Application class (e.g. `google-chrome`, `com.mitchellh.ghostty`)
   - `name` — Window title
   - `x`, `y`, `width`, `height` — Geometry
-  - `desktop` — Virtual desktop number
+  - `desktop` — 0-based virtual desktop index (matches KWin VDM)
+  - `sticky` — `true` if the window appears on all desktops (e.g. panels, some system windows)
   - `minimized`, `fullscreen` — Window state
-  - `pid`, `cmdline` — Process info (for identification, not used on restore)
+  - `pid`, `cmdline` — Process info (for identification and auto-launch)
 
 Plasma shell elements (panels, widgets) are captured but skipped on restore — Plasma manages those itself.
 
@@ -87,16 +105,17 @@ Plasma shell elements (panels, widgets) are captured but skipped on restore — 
 1. **Displays first** — `kscreen-doctor` applies saved monitor positions, modes, and scales; waits 2 seconds for monitors to settle
 2. **Window matching** — Each saved window is matched against currently open windows by exact `class + title`, falling back to `class`-only match for same-app windows. Each current window is only matched once to prevent double-assignment.
 3. **Auto-launch missing apps** — If a saved window is not currently open and its `cmdline` was captured, `kdewin` launches the application automatically and waits for its window to appear.
-4. **Reposition** — Each matched window is moved and resized to its saved geometry in a single atomic operation via the KWin D-Bus Scripting API (avoiding a `kdotool windowmove` bug on KDE 6 Wayland where individual property assignments are silently ignored). Windows are assigned to the correct virtual desktop if applicable.
+4. **Desktop assignment** — Sticky windows (`sticky: true`) are left on all desktops. Non-sticky windows are moved to the correct virtual desktop via `kdotool set_desktop_for_window`.
+5. **Reposition** — Each matched window is moved and resized to its saved geometry in a single atomic operation via the KWin D-Bus Scripting API (avoiding a `kdotool windowmove` bug on KDE 6 Wayland where individual property assignments are silently ignored).
 
 ## Profiles
 
 Stored at `~/.config/window-saver/profiles/<name>.json`.
 
-Profile format:
+Profile format (v2):
 ```json
 {
-  "version": 1,
+  "version": 2,
   "profile_name": "coding",
   "created": "2026-06-03T21:47:49+08:00",
   "hostname": "fd01",
@@ -105,6 +124,12 @@ Profile format:
   "windows": [ ... ]
 }
 ```
+
+**Version history:**
+- **v1** (legacy): `desktop` stored kdotool's raw 1-based value; sticky windows had `desktop=0` with no `sticky` field.
+- **v2** (current): `desktop` is 0-based (matches KWin VDM); sticky windows have `sticky: true`.
+
+Old v1 profiles are loaded automatically with backward-compatible conversion.
 
 ## Limitations
 
